@@ -29,17 +29,13 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  const { action } = req.query;
+  const { code } = req.query;
 
-  if (action === 'start') {
+  if (!code) {
     return handleStart(req, res);
   }
 
-  if (action === 'callback') {
-    return handleCallback(req, res);
-  }
-
-  return res.status(404).json({ error: 'Unknown action' });
+  return handleCallback(req, res, code);
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -51,7 +47,7 @@ function handleStart(req, res) {
     return res.status(500).send('Google client ID not configured');
   }
 
-  const redirectUri = `${getBaseUrl(req)}/api/auth/google?action=callback`;
+  const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
   const googleAuthUrl =
     'https://accounts.google.com/o/oauth2/v2/auth' +
@@ -68,20 +64,14 @@ function handleStart(req, res) {
 // OAuth callback
 // ─────────────────────────────────────────────────────────────
 
-async function handleCallback(req, res) {
-  const { code, error } = req.query;
-
-  if (error) {
-    console.error('Google OAuth error:', error);
+async function handleCallback(req, res, code) {
+  if (req.query.error) {
+    console.error('Google OAuth error:', req.query.error);
     return res.send(renderErrorPage('Google authentication failed.'));
   }
 
-  if (!code) {
-    return res.status(400).send('Authorization code missing');
-  }
-
   try {
-    const redirectUri = `${getBaseUrl(req)}/api/auth/google?action=callback`;
+    const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
     const tokenResponse = await axios.post(
       'https://oauth2.googleapis.com/token',
@@ -152,19 +142,34 @@ async function findOrCreateOutsetaUser(googleUser) {
   const firstName = googleUser.given_name || 'Google';
   const lastName = googleUser.family_name || 'User';
 
+  // Use /crm/registrations endpoint with free subscription
+  // This is the same endpoint Outseta's signup form uses
   const createPayload = {
-    Email: googleUser.email,
-    FirstName: firstName,
-    LastName: lastName,
-    Account: {
-      Name: `${firstName} ${lastName}`,
-    },
+    Name: `${firstName} ${lastName}`,
+    PersonAccount: [
+      {
+        IsPrimary: true,
+        Person: {
+          Email: googleUser.email,
+          FirstName: firstName,
+          LastName: lastName,
+        },
+      },
+    ],
+    Subscriptions: [
+      {
+        Plan: {
+          Uid: process.env.OUTSETA_FREE_PLAN_UID,
+        },
+        BillingRenewalTerm: 1, // 1=Monthly (free plan doesn't support OneTime)
+      },
+    ],
   };
 
-  console.log('Creating Outseta person with payload:', createPayload);
+  console.log('Creating Outseta account via /crm/registrations');
 
   const createResponse = await axios.post(
-    `${apiBase}/crm/people`,
+    `${apiBase}/crm/registrations`,
     createPayload,
     {
       headers: {
@@ -175,7 +180,10 @@ async function findOrCreateOutsetaUser(googleUser) {
     }
   );
 
-  return createResponse.data;
+  console.log('Account created:', createResponse.data.Uid, 'Person:', createResponse.data.PrimaryContact?.Uid);
+
+  // The registration endpoint returns the full Account with PrimaryContact
+  return createResponse.data.PrimaryContact;
 }
 
 async function generateOutsetaToken(email) {
@@ -297,4 +305,3 @@ function toJsonSafe(value) {
     return String(value);
   }
 }
-
