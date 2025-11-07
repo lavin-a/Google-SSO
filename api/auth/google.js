@@ -47,7 +47,19 @@ function handleStart(req, res) {
     return res.status(500).send('Google client ID not configured');
   }
 
+  const returnUrl = req.query.return_url;
+  
+  if (!returnUrl) {
+    return res.status(400).send('Missing return_url parameter');
+  }
+
   const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
+
+  // Store return URL in a simple map (in production, use Redis)
+  const state = require('crypto').randomBytes(16).toString('hex');
+  if (!global.googleStateStore) global.googleStateStore = new Map();
+  global.googleStateStore.set(state, { returnUrl, createdAt: Date.now() });
+  setTimeout(() => global.googleStateStore.delete(state), 10 * 60 * 1000);
 
   const googleAuthUrl =
     'https://accounts.google.com/o/oauth2/v2/auth' +
@@ -55,7 +67,7 @@ function handleStart(req, res) {
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&response_type=code` +
     `&scope=${encodeURIComponent('openid email profile')}` +
-    `&prompt=none`;
+    `&state=${encodeURIComponent(state)}`;
 
   res.writeHead(302, { Location: googleAuthUrl });
   res.end();
@@ -72,6 +84,18 @@ async function handleCallback(req, res, code) {
   }
 
   try {
+    const state = req.query.state;
+    if (!global.googleStateStore) global.googleStateStore = new Map();
+    const stateData = global.googleStateStore.get(state);
+    const returnUrl = stateData?.returnUrl;
+
+    if (!returnUrl) {
+      console.error('State not found for Google OAuth');
+      return res.send(renderErrorPage('Session expired. Please try again.'));
+    }
+
+    global.googleStateStore.delete(state);
+
     const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
     const tokenResponse = await axios.post(
@@ -102,7 +126,7 @@ async function handleCallback(req, res, code) {
 
     const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
 
-    return res.send(renderSuccessPage(outsetaToken));
+    return res.send(renderSuccessPage(outsetaToken, returnUrl));
   } catch (err) {
     dumpError('[GoogleSSO]', err);
     return res.send(renderErrorPage('Unable to complete sign in.'));
@@ -197,7 +221,7 @@ async function generateOutsetaToken(email) {
 // UI helpers
 // ─────────────────────────────────────────────────────────────
 
-function renderSuccessPage(token) {
+function renderSuccessPage(token, returnUrl) {
   return `<!DOCTYPE html>
 <html>
   <head>
@@ -208,10 +232,11 @@ function renderSuccessPage(token) {
     <script>
       (function() {
         const token = ${JSON.stringify(token)};
-        if (window.opener) {
-          window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', outsetaToken: token }, '*');
-        }
-        window.close();
+        const returnUrl = ${JSON.stringify(returnUrl)};
+        
+        const url = new URL(returnUrl);
+        url.hash = 'google_token=' + token;
+        window.location.href = url.toString();
       })();
     </script>
   </body>
@@ -233,7 +258,6 @@ function renderErrorPage(message) {
     <div style="text-align:center;">
       <h1>Sign in failed</h1>
       <p>${message}</p>
-      <button onclick="window.close()" style="padding: 10px 20px;">Close</button>
     </div>
   </body>
 </html>`;
