@@ -54,7 +54,8 @@ function handleStart(req, res) {
     `?client_id=${encodeURIComponent(process.env.GOOGLE_CLIENT_ID)}` +
     `&redirect_uri=${encodeURIComponent(redirectUri)}` +
     `&response_type=code` +
-    `&scope=${encodeURIComponent('openid email profile')}`;
+    `&scope=${encodeURIComponent('openid email profile')}` +
+    `&prompt=none`;
 
   res.writeHead(302, { Location: googleAuthUrl });
   res.end();
@@ -96,18 +97,10 @@ async function handleCallback(req, res, code) {
     });
 
     const googleUser = userResponse.data;
-    console.log('Google user:', googleUser.email);
 
     const outsetaPerson = await findOrCreateOutsetaUser(googleUser);
-    console.log('Outseta person UID:', outsetaPerson.Uid, 'Account UID:', outsetaPerson.Account?.Uid);
 
     const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
-
-    console.log('[GoogleSSO]', JSON.stringify({
-      email: outsetaPerson.Email,
-      uid: outsetaPerson.Uid,
-      accountUid: outsetaPerson.Account?.Uid || null,
-    }));
 
     return res.send(renderSuccessPage(outsetaToken));
   } catch (err) {
@@ -166,8 +159,6 @@ async function findOrCreateOutsetaUser(googleUser) {
     ],
   };
 
-  console.log('Creating Outseta account via /crm/registrations');
-
   const createResponse = await axios.post(
     `${apiBase}/crm/registrations`,
     createPayload,
@@ -180,9 +171,6 @@ async function findOrCreateOutsetaUser(googleUser) {
     }
   );
 
-  console.log('Account created:', createResponse.data.Uid, 'Person:', createResponse.data.PrimaryContact?.Uid);
-
-  // The registration endpoint returns the full Account with PrimaryContact
   return createResponse.data.PrimaryContact;
 }
 
@@ -214,25 +202,16 @@ function renderSuccessPage(token) {
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Signed in</title>
-    <style>
-      body { margin: 0; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
-      button { padding: 12px 24px; background: #000; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
-    </style>
+    <title>Signing in...</title>
   </head>
   <body>
-    <div style="text-align:center;">
-      <h1>Signed in with Google</h1>
-      <p>You can close this window.</p>
-      <button onclick="window.close()">Close</button>
-    </div>
     <script>
       (function() {
         const token = ${JSON.stringify(token)};
         if (window.opener) {
           window.opener.postMessage({ type: 'GOOGLE_AUTH_SUCCESS', outsetaToken: token }, '*');
         }
-        setTimeout(() => window.close(), 1200);
+        window.close();
       })();
     </script>
   </body>
