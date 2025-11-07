@@ -18,6 +18,8 @@ const allowedReturnUrls = [
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 
+const ACCOUNT_CONFLICT_MESSAGE = "This email is already registered. Please sign in using a known method, then link this provider from your account settings.";
+
 const redirectHostAllowlist = new Set([
   ...allowedReturnUrls.map(getHost),
   'aware-amount-178968.framer.app',
@@ -102,15 +104,45 @@ async function handleStart(req, res) {
     return res.status(500).send('Google client ID not configured');
   }
 
-  const requestedReturnUrl = req.query.return_url;
+  const intent = (req.query.intent || 'login').toLowerCase();
+  if (!['login', 'link'].includes(intent)) {
+    return res.status(400).send('Invalid intent');
+  }
 
+  const requestedReturnUrl = req.query.return_url;
   const returnUrl = sanitizeRedirect(requestedReturnUrl, DEFAULT_RETURN_URL);
+
+  let linkPersonUid = null;
+  if (intent === 'link') {
+    const linkToken = req.query.link_token;
+    const requestedLinkUid = req.query.link_person_uid;
+
+    if (!linkToken || !requestedLinkUid) {
+      return res.status(400).send('Missing linking parameters');
+    }
+
+    try {
+      const profile = await verifyOutsetaAccessToken(linkToken);
+      if (profile?.Uid !== requestedLinkUid) {
+        return res.status(403).send('Invalid linking session');
+      }
+    } catch (err) {
+      console.error('Outseta token verification failed', err.message);
+      return res.status(403).send('Invalid linking session');
+    }
+
+    linkPersonUid = requestedLinkUid;
+  }
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
   // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
-  await kv.set(`google:state:${state}`, { returnUrl, createdAt: Date.now() }, { ex: 600 });
+  await kv.set(
+    `google:state:${state}`,
+    { returnUrl, intent, linkPersonUid, createdAt: Date.now() },
+    { ex: 600 }
+  );
 
   const googleAuthUrl =
     'https://accounts.google.com/o/oauth2/v2/auth' +
@@ -138,6 +170,8 @@ async function handleCallback(req, res, code) {
     const state = req.query.state;
     const stateData = await kv.get(`google:state:${state}`);
     const returnUrl = stateData?.returnUrl;
+    const intent = stateData?.intent || 'login';
+    const linkPersonUid = stateData?.linkPersonUid || null;
 
     if (!returnUrl) {
       console.error('State not found for Google OAuth');
@@ -171,10 +205,126 @@ async function handleCallback(req, res, code) {
     });
 
     const googleUser = userResponse.data;
+    const googleId = googleUser.id;
+    const normalizedEmail = googleUser.email ? googleUser.email.toLowerCase() : null;
+    const googleEmail = googleUser.email || normalizedEmail;
 
-    const outsetaPerson = await findOrCreateOutsetaUser(googleUser);
+    console.log('[GoogleSSO] callback params', {
+      intent,
+      googleId,
+      emailPresent: Boolean(normalizedEmail),
+    });
 
-    const outsetaToken = await generateOutsetaToken(outsetaPerson.Email);
+    const existingByGoogleId = await findPersonByField('GoogleId', googleId);
+
+    if (existingByGoogleId) {
+      console.log('[GoogleSSO] matched by GoogleId', {
+        personUid: existingByGoogleId.Uid,
+        intent,
+      });
+      if (intent === 'link') {
+        if (!linkPersonUid || existingByGoogleId.Uid !== linkPersonUid) {
+          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+        }
+
+        if (googleEmail && existingByGoogleId.GoogleEmail !== googleEmail) {
+          await updatePerson(existingByGoogleId.Uid, {
+            Uid: existingByGoogleId.Uid,
+            Email: existingByGoogleId.Email,
+            FirstName: existingByGoogleId.FirstName,
+            LastName: existingByGoogleId.LastName,
+            GoogleId: googleId,
+            GoogleEmail: googleEmail,
+          });
+        }
+
+        return res.send(renderLinkSuccessPage(returnUrl, 'google'));
+      }
+
+      if (googleEmail && existingByGoogleId.GoogleEmail !== googleEmail) {
+        await updatePerson(existingByGoogleId.Uid, {
+          Uid: existingByGoogleId.Uid,
+          Email: existingByGoogleId.Email,
+          FirstName: existingByGoogleId.FirstName,
+          LastName: existingByGoogleId.LastName,
+          GoogleId: googleId,
+          GoogleEmail: googleEmail,
+        });
+      }
+
+      const outsetaToken = await generateOutsetaToken(existingByGoogleId.Email);
+      return res.send(renderSuccessPage(outsetaToken, returnUrl));
+    }
+
+    if (intent === 'link') {
+      if (!linkPersonUid) {
+        console.log('[GoogleSSO] link intent missing UID');
+        return res.send(renderErrorPage('Linking session expired.'));
+      }
+
+      const person = await getPersonByUid(linkPersonUid);
+      if (!person) {
+        return res.send(renderErrorPage('Unable to locate your account.'));
+      }
+
+      console.log('[GoogleSSO] updating link person with GoogleId', {
+        linkPersonUid,
+      });
+      const updatePayload = {
+        Uid: linkPersonUid,
+        Email: person.Email,
+        FirstName: person.FirstName,
+        LastName: person.LastName,
+        GoogleId: googleId,
+      };
+
+      if (googleEmail) {
+        updatePayload.GoogleEmail = googleEmail;
+      }
+
+      await updatePerson(linkPersonUid, updatePayload);
+
+      return res.send(renderLinkSuccessPage(returnUrl, 'google'));
+    }
+
+    if (normalizedEmail) {
+      const existingByEmail = await findPersonByEmail(normalizedEmail);
+      if (existingByEmail) {
+        const storedGoogleId = existingByEmail.GoogleId
+          ? String(existingByEmail.GoogleId).replace(/,/g, '')
+          : null;
+        console.log('[GoogleSSO] matched by email', {
+          personUid: existingByEmail.Uid,
+          storedGoogleId,
+          intent,
+        });
+        if (intent === 'login' && storedGoogleId && storedGoogleId === googleId) {
+          if (googleEmail && existingByEmail.GoogleEmail !== googleEmail) {
+            await updatePerson(existingByEmail.Uid, {
+              Uid: existingByEmail.Uid,
+              Email: existingByEmail.Email,
+              FirstName: existingByEmail.FirstName,
+              LastName: existingByEmail.LastName,
+              GoogleId: googleId,
+              GoogleEmail: googleEmail,
+            });
+          }
+          const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+          return res.send(renderSuccessPage(outsetaToken, returnUrl));
+        }
+
+        console.log('[GoogleSSO] email conflict', {
+          reason: 'googleId mismatch or linking attempt',
+        });
+        return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+      } else {
+        console.log('[GoogleSSO] no user by email');
+      }
+    }
+
+    console.log('[GoogleSSO] creating new user for Google login');
+    const createdPerson = await createGoogleOutsetaUser(googleUser);
+    const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
     return res.send(renderSuccessPage(outsetaToken, returnUrl));
   } catch (err) {
@@ -187,31 +337,11 @@ async function handleCallback(req, res, code) {
 // Outseta helpers
 // ─────────────────────────────────────────────────────────────
 
-async function findOrCreateOutsetaUser(googleUser) {
-  const apiBase = `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
-  const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
-
-  // Try to find existing person
-  try {
-    const search = await axios.get(`${apiBase}/crm/people`, {
-      headers: authHeader,
-      params: { Email: googleUser.email },
-      timeout: 8000,
-    });
-
-    if (search.data.items && search.data.items.length > 0) {
-      return search.data.items[0];
-    }
-  } catch (err) {
-    console.warn('Outseta search failed, will try to create:', err.message);
-  }
-
+async function createGoogleOutsetaUser(googleUser) {
   const firstName = googleUser.given_name || 'Google';
   const lastName = googleUser.family_name || 'User';
 
-  // Use /crm/registrations endpoint with free subscription
-  // This is the same endpoint Outseta's signup form uses
-  const createPayload = {
+  const registration = await createRegistration({
     Name: `${firstName} ${lastName}`,
     PersonAccount: [
       {
@@ -220,6 +350,8 @@ async function findOrCreateOutsetaUser(googleUser) {
           Email: googleUser.email,
           FirstName: firstName,
           LastName: lastName,
+          GoogleId: googleUser.id,
+          GoogleEmail: googleUser.email,
         },
       },
     ],
@@ -228,24 +360,12 @@ async function findOrCreateOutsetaUser(googleUser) {
         Plan: {
           Uid: process.env.OUTSETA_FREE_PLAN_UID,
         },
-        BillingRenewalTerm: 1, // 1=Monthly (free plan doesn't support OneTime)
+        BillingRenewalTerm: 1,
       },
     ],
-  };
+  });
 
-  const createResponse = await axios.post(
-    `${apiBase}/crm/registrations`,
-    createPayload,
-    {
-      headers: {
-        ...authHeader,
-        'Content-Type': 'application/json',
-      },
-      timeout: 8000,
-    }
-  );
-
-  return createResponse.data.PrimaryContact;
+  return registration.PrimaryContact;
 }
 
 async function generateOutsetaToken(email) {
@@ -313,10 +433,147 @@ function renderErrorPage(message) {
 </html>`;
 }
 
+function renderRedirectWithError(returnUrl, code, message) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('error', code);
+  if (message) {
+    params.set('message', message);
+  }
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Redirecting...</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
+    </script>
+  </body>
+</html>`;
+}
+
+function renderLinkSuccessPage(returnUrl, provider) {
+  const url = new URL(returnUrl);
+  const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
+  params.set('link', 'success');
+  params.set('provider', provider);
+  url.hash = params.toString();
+
+  return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Link Successful</title>
+  </head>
+  <body>
+    <script>
+      window.location.href = ${JSON.stringify(url.toString())};
+    </script>
+  </body>
+</html>`;
+}
+
 function getBaseUrl(req) {
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${protocol}://${host}`;
+}
+
+function getOutsetaApiBase() {
+  if (!process.env.OUTSETA_DOMAIN) {
+    throw new Error('OUTSETA_DOMAIN not configured');
+  }
+  return `https://${process.env.OUTSETA_DOMAIN}/api/v1`;
+}
+
+function getOutsetaAuthHeaders() {
+  if (!process.env.OUTSETA_API_KEY || !process.env.OUTSETA_SECRET_KEY) {
+    throw new Error('Outseta API credentials not configured');
+  }
+
+  return {
+    Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}`,
+    'Content-Type': 'application/json',
+  };
+}
+
+async function verifyOutsetaAccessToken(token) {
+  if (!token) {
+    throw new Error('Missing Outseta access token');
+  }
+
+  const apiBase = getOutsetaApiBase();
+
+  const response = await axios.get(`${apiBase}/profile`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function getPersonByUid(uid) {
+  if (!uid) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people/${uid}`, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
+}
+
+async function findPersonByEmail(email) {
+  if (!email) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { Email: email },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function findPersonByField(field, value) {
+  if (!field || value == null) return null;
+
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.get(`${apiBase}/crm/people`, {
+    headers: getOutsetaAuthHeaders(),
+    params: { [field]: value },
+    timeout: 8000,
+  });
+
+  return response.data.items?.[0] ?? null;
+}
+
+async function updatePerson(uid, payload) {
+  if (!uid) throw new Error('Cannot update person without UID');
+
+  const apiBase = getOutsetaApiBase();
+  await axios.put(`${apiBase}/crm/people/${uid}`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+}
+
+async function createRegistration(payload) {
+  const apiBase = getOutsetaApiBase();
+  const response = await axios.post(`${apiBase}/crm/registrations`, payload, {
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
+
+  return response.data;
 }
 
 function dumpError(tag, error) {
@@ -358,3 +615,8 @@ function toJsonSafe(value) {
     return String(value);
   }
 }
+
+module.exports.config = {
+  maxDuration: 30,
+  memory: 1024,
+};
