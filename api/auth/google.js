@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { kv } = require('@vercel/kv');
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -8,8 +9,15 @@ const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
   'https://www.almeidaracingacademy.com',
-  'https://almeidaracingacademy.outseta.com',
 ];
+
+// Rate limiting: 10 requests per minute per IP
+async function checkRateLimit(ip) {
+  const key = `google:ratelimit:${ip}`;
+  const count = await kv.incr(key);
+  if (count === 1) await kv.expire(key, 60);
+  return count <= 10;
+}
 
 // ─────────────────────────────────────────────────────────────
 // Main handler
@@ -17,7 +25,7 @@ const allowedOrigins = [
 
 module.exports = async (req, res) => {
   const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin) || origin?.endsWith('.framer.app')) {
+  if (allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
 
@@ -27,6 +35,12 @@ module.exports = async (req, res) => {
 
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
+  }
+
+  // Rate limiting
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.connection?.remoteAddress || 'unknown';
+  if (!await checkRateLimit(ip)) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
 
   const { code } = req.query;
@@ -42,7 +56,7 @@ module.exports = async (req, res) => {
 // OAuth start
 // ─────────────────────────────────────────────────────────────
 
-function handleStart(req, res) {
+async function handleStart(req, res) {
   if (!process.env.GOOGLE_CLIENT_ID) {
     return res.status(500).send('Google client ID not configured');
   }
@@ -55,11 +69,9 @@ function handleStart(req, res) {
 
   const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
-  // Store return URL in a simple map (in production, use Redis)
+  // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
-  if (!global.googleStateStore) global.googleStateStore = new Map();
-  global.googleStateStore.set(state, { returnUrl, createdAt: Date.now() });
-  setTimeout(() => global.googleStateStore.delete(state), 10 * 60 * 1000);
+  await kv.set(`google:state:${state}`, { returnUrl, createdAt: Date.now() }, { ex: 600 });
 
   const googleAuthUrl =
     'https://accounts.google.com/o/oauth2/v2/auth' +
@@ -85,8 +97,7 @@ async function handleCallback(req, res, code) {
 
   try {
     const state = req.query.state;
-    if (!global.googleStateStore) global.googleStateStore = new Map();
-    const stateData = global.googleStateStore.get(state);
+    const stateData = await kv.get(`google:state:${state}`);
     const returnUrl = stateData?.returnUrl;
 
     if (!returnUrl) {
@@ -94,7 +105,7 @@ async function handleCallback(req, res, code) {
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    global.googleStateStore.delete(state);
+    await kv.del(`google:state:${state}`);
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
