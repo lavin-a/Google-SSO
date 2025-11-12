@@ -227,7 +227,7 @@ async function handleCallback(req, res, code) {
       });
       if (intent === 'link') {
         if (!linkPersonUid || existingByGoogleId.Uid !== linkPersonUid) {
-          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+          return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'google'));
         }
 
         if (googleEmail && existingByGoogleId.GoogleEmail !== googleEmail) {
@@ -319,7 +319,7 @@ async function handleCallback(req, res, code) {
         console.log('[GoogleSSO] email conflict', {
           reason: 'googleId mismatch or linking attempt',
         });
-        return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE));
+        return res.send(renderRedirectWithError(returnUrl, 'account_exists', ACCOUNT_CONFLICT_MESSAGE, 'google'));
       } else {
         console.log('[GoogleSSO] no user by email');
       }
@@ -436,12 +436,15 @@ function renderErrorPage(message) {
 </html>`;
 }
 
-function renderRedirectWithError(returnUrl, code, message) {
+function renderRedirectWithError(returnUrl, code, message, provider) {
   const url = new URL(returnUrl);
   const params = new URLSearchParams(url.hash?.replace(/^#/, '') || '');
   params.set('error', code);
   if (message) {
     params.set('message', message);
+  }
+  if (provider) {
+    params.set('provider', provider);
   }
   url.hash = params.toString();
 
