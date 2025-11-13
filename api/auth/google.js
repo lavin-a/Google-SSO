@@ -76,7 +76,7 @@ module.exports = async (req, res) => {
   }
 
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
 
   if (req.method === 'OPTIONS') {
@@ -89,7 +89,11 @@ module.exports = async (req, res) => {
     return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
 
-  const { code } = req.query;
+  const { code, action } = req.query;
+
+  if (req.method === 'POST' && action === 'disconnect') {
+    return handleDisconnect(req, res);
+  }
 
   if (!code) {
     return handleStart(req, res);
@@ -333,6 +337,58 @@ async function handleCallback(req, res, code) {
   } catch (err) {
     dumpError('[GoogleSSO]', err);
     return res.send(renderErrorPage('Unable to complete sign in.'));
+  }
+}
+
+async function handleDisconnect(req, res) {
+  try {
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+      return res.status(401).json({ error: 'Missing authorization bearer token.' });
+    }
+
+    const accessToken = authHeader.slice(7).trim();
+    if (!accessToken) {
+      return res.status(401).json({ error: 'Missing authorization bearer token.' });
+    }
+
+    const profile = await verifyOutsetaAccessToken(accessToken);
+    if (!profile?.Uid) {
+      return res.status(403).json({ error: 'Unable to validate session.' });
+    }
+
+    const person = await getPersonByUid(profile.Uid);
+    if (!person) {
+      return res.status(404).json({ error: 'Account not found.' });
+    }
+
+    if (!hasPassword(person)) {
+      return res.status(412).json({
+        error: 'Add a password to your account before disconnecting Google.',
+      });
+    }
+
+    const alreadyDisconnected = !person.GoogleId && !person.GoogleEmail;
+
+    if (!alreadyDisconnected) {
+      await updatePerson(person.Uid, {
+        Uid: person.Uid,
+        Email: person.Email,
+        FirstName: person.FirstName,
+        LastName: person.LastName,
+        GoogleId: '',
+        GoogleEmail: '',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      provider: 'google',
+      disconnected: !alreadyDisconnected,
+    });
+  } catch (err) {
+    dumpError('[GoogleSSO][disconnect]', err);
+    return res.status(500).json({ error: 'Unable to disconnect Google at this time.' });
   }
 }
 
@@ -626,3 +682,30 @@ module.exports.config = {
   maxDuration: 30,
   memory: 1024,
 };
+
+function hasPassword(person) {
+  if (!person) return false;
+
+  const candidateKeys = [
+    'PasswordLastUpdated',
+    'PasswordLastUpdatedUtc',
+    'PasswordLastUpdatedDate',
+    'PasswordLastUpdatedDateUtc',
+    'PasswordLastUpdatedDateTime',
+    'PasswordLastUpdatedDateTimeUtc',
+  ];
+
+  for (const key of candidateKeys) {
+    const value = person[key];
+    if (!value) continue;
+    if (typeof value === 'string' && value.trim().length > 0) return true;
+    if (value instanceof Date && !isNaN(value.getTime())) return true;
+    if (typeof value === 'number' && value > 0) return true;
+  }
+
+  if (person.PasswordMustChange === true) return false;
+  if (person.HasPassword === true) return true;
+  if (person.PasswordMustChange === false && person.HasLoggedIn) return true;
+
+  return false;
+}
