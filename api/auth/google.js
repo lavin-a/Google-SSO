@@ -9,6 +9,7 @@ const allowedOrigins = [
   'https://aware-amount-178968.framer.app',
   'https://almeidaracingacademy.com',
   'https://www.almeidaracingacademy.com',
+  'https://new.almeidaracingacademy.com',
 ];
 
 const allowedReturnUrls = [
@@ -18,6 +19,8 @@ const allowedReturnUrls = [
   'https://almeidaracingacademy.com/account',
   'https://www.almeidaracingacademy.com/sign-in',
   'https://www.almeidaracingacademy.com/account',
+  'https://new.almeidaracingacademy.com/sign-in',
+  'https://new.almeidaracingacademy.com/account',
 ];
 const DEFAULT_RETURN_URL = allowedReturnUrls[0];
 
@@ -28,6 +31,7 @@ const redirectHostAllowlist = new Set([
   'aware-amount-178968.framer.app',
   'almeidaracingacademy.com',
   'www.almeidaracingacademy.com',
+  'new.almeidaracingacademy.com',
 ].filter(Boolean));
 
 function getHost(url) {
