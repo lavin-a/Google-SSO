@@ -144,6 +144,12 @@ async function handleStart(req, res) {
 
   // Store return URL in Vercel KV with 10 minute expiration
   const state = require('crypto').randomBytes(16).toString('hex');
+  console.log('[GoogleSSO] storing OAuth state', {
+    key: `google:state:${state}`,
+    intent,
+    hasReturnUrl: Boolean(returnUrl),
+    createdAt: Date.now(),
+  });
   await kv.set(
     `google:state:${state}`,
     { returnUrl, intent, linkPersonUid, createdAt: Date.now() },
@@ -174,17 +180,30 @@ async function handleCallback(req, res, code) {
 
   try {
     const state = req.query.state;
-    const stateData = await kv.get(`google:state:${state}`);
+    console.log('[GoogleSSO] received OAuth state', { state });
+    const stateKey = `google:state:${state}`;
+    const usedKey = `google:state:used:${state}`;
+    const stateData = await kv.get(stateKey);
     const returnUrl = stateData?.returnUrl;
     const intent = stateData?.intent || 'login';
     const linkPersonUid = stateData?.linkPersonUid || null;
 
     if (!returnUrl) {
-      console.error('State not found for Google OAuth');
+      const usedData = await kv.get(usedKey);
+      if (usedData?.returnUrl) {
+        if (usedData.mode === 'link') {
+          return res.send(renderLinkSuccessPage(usedData.returnUrl, 'google'));
+        }
+        return res.send(renderSuccessPage(usedData.outsetaToken || '', usedData.returnUrl));
+      }
+      console.error('State not found for Google OAuth', { state });
       return res.send(renderErrorPage('Session expired. Please try again.'));
     }
 
-    await kv.del(`google:state:${state}`);
+    const finalizeSuccess = async (mode, token) => {
+      await kv.set(usedKey, { returnUrl, outsetaToken: token || '', mode }, { ex: 300 });
+      await kv.del(stateKey);
+    };
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
@@ -244,6 +263,7 @@ async function handleCallback(req, res, code) {
           });
         }
 
+        await finalizeSuccess('link');
         return res.send(renderLinkSuccessPage(returnUrl, 'google'));
       }
 
@@ -259,6 +279,7 @@ async function handleCallback(req, res, code) {
       }
 
       const outsetaToken = await generateOutsetaToken(existingByGoogleId.Email);
+      await finalizeSuccess('login', outsetaToken);
       return res.send(renderSuccessPage(outsetaToken, returnUrl));
     }
 
@@ -290,6 +311,7 @@ async function handleCallback(req, res, code) {
 
       await updatePerson(linkPersonUid, updatePayload);
 
+      await finalizeSuccess('link');
       return res.send(renderLinkSuccessPage(returnUrl, 'google'));
     }
 
@@ -312,6 +334,7 @@ async function handleCallback(req, res, code) {
               GoogleEmail: googleEmail || normalizedEmail,
             });
             const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+            await finalizeSuccess('login', outsetaToken);
             return res.send(renderSuccessPage(outsetaToken, returnUrl));
           }
         }
@@ -333,6 +356,7 @@ async function handleCallback(req, res, code) {
             });
           }
           const outsetaToken = await generateOutsetaToken(existingByEmail.Email);
+          await finalizeSuccess('login', outsetaToken);
           return res.send(renderSuccessPage(outsetaToken, returnUrl));
         }
 
@@ -349,6 +373,7 @@ async function handleCallback(req, res, code) {
     const createdPerson = await createGoogleOutsetaUser(googleUser);
     const outsetaToken = await generateOutsetaToken(createdPerson.Email);
 
+    await finalizeSuccess('login', outsetaToken);
     return res.send(renderSuccessPage(outsetaToken, returnUrl));
   } catch (err) {
     dumpError('[GoogleSSO]', err);
@@ -404,6 +429,11 @@ async function handleDisconnect(req, res) {
     });
   } catch (err) {
     dumpError('[GoogleSSO][disconnect]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to disconnect Google at this time.' });
   }
 }
@@ -435,6 +465,11 @@ async function handleSendPasswordReset(req, res) {
     return res.status(200).json({ success: true });
   } catch (err) {
     dumpError('[GoogleSSO][password-reset]', err);
+
+    if (err.status === 401 || err.response?.status === 401) {
+      return res.status(401).json({ error: 'Session expired. Please try again.', code: 'TOKEN_EXPIRED' });
+    }
+
     return res.status(500).json({ error: 'Unable to send password email. Please try again later.' });
   }
 }
@@ -672,7 +707,7 @@ async function findPersonByField(field, value) {
   const response = await axios.get(`${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
     params: { [field]: value },
-    timeout: 8000,
+    timeout: 12000,
   });
 
   return response.data.items?.[0] ?? null;
