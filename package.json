@@ -3,8 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@vercel/kv": "^1.0.1",
-    "axios": "^1.6.0"
+    "@upstash/redis": "^1.36.0",
+    "vercel": "^50.38.2"
   }
 }
-

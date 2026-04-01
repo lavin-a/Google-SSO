@@ -1,5 +1,50 @@
-const axios = require('axios');
-const { kv } = require('@vercel/kv');
+async function httpRequest(method, url, { headers = {}, data, params, timeout = 8000 } = {}) {
+  if (params) {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v != null)
+    ).toString();
+    if (qs) url += (url.includes('?') ? '&' : '?') + qs;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const opts = { method, headers: { ...headers }, signal: controller.signal };
+
+  if (data != null) {
+    if (data instanceof URLSearchParams) {
+      opts.body = data.toString();
+    } else if (typeof data === 'string') {
+      opts.body = data;
+    } else {
+      opts.body = JSON.stringify(data);
+      if (!opts.headers['Content-Type'] && !opts.headers['content-type']) {
+        opts.headers['Content-Type'] = 'application/json';
+      }
+    }
+  }
+
+  try {
+    const res = await fetch(url, opts);
+    const ct = res.headers.get('content-type') || '';
+    const body = ct.includes('json') ? await res.json() : await res.text();
+
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status} ${res.statusText}`);
+      err.status = res.status;
+      err.response = { status: res.status, statusText: res.statusText, data: body, headers: Object.fromEntries(res.headers) };
+      throw err;
+    }
+
+    return { data: body, status: res.status };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+const { Redis } = require('@upstash/redis');
+const kv = new Redis({
+  url: process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
 // ─────────────────────────────────────────────────────────────
 // Constants
@@ -207,24 +252,21 @@ async function handleCallback(req, res, code) {
 
     const redirectUri = `${getBaseUrl(req)}/api/auth/google`;
 
-    const tokenResponse = await axios.post(
-      'https://oauth2.googleapis.com/token',
-      new URLSearchParams({
+    const tokenResponse = await httpRequest('POST', 'https://oauth2.googleapis.com/token', {
+      data: new URLSearchParams({
         code,
         client_id: process.env.GOOGLE_CLIENT_ID,
         client_secret: process.env.GOOGLE_CLIENT_SECRET,
         redirect_uri: redirectUri,
         grant_type: 'authorization_code',
       }),
-      {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        timeout: 8000,
-      }
-    );
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 8000,
+    });
 
     const accessToken = tokenResponse.data.access_token;
 
-    const userResponse = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+    const userResponse = await httpRequest('GET', 'https://www.googleapis.com/oauth2/v2/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
       timeout: 8000,
     });
@@ -514,17 +556,14 @@ async function generateOutsetaToken(email) {
   const authHeader = { Authorization: `Outseta ${process.env.OUTSETA_API_KEY}:${process.env.OUTSETA_SECRET_KEY}` };
 
   try {
-    const tokenResponse = await axios.post(
-      `${apiBase}/tokens`,
-      { username: email },
-      {
-        headers: {
-          ...authHeader,
-          'Content-Type': 'application/json',
-        },
-        timeout: 8000,
-      }
-    );
+    const tokenResponse = await httpRequest('POST', `${apiBase}/tokens`, {
+      data: { username: email },
+      headers: {
+        ...authHeader,
+        'Content-Type': 'application/json',
+      },
+      timeout: 8000,
+    });
 
     return tokenResponse.data.access_token || tokenResponse.data;
   } catch (error) {
@@ -662,7 +701,7 @@ async function verifyOutsetaAccessToken(token) {
 
   const apiBase = getOutsetaApiBase();
 
-  const response = await axios.get(`${apiBase}/profile`, {
+  const response = await httpRequest('GET', `${apiBase}/profile`, {
     headers: {
       Authorization: `Bearer ${token}`,
     },
@@ -676,7 +715,7 @@ async function getPersonByUid(uid) {
   if (!uid) return null;
 
   const apiBase = getOutsetaApiBase();
-  const response = await axios.get(`${apiBase}/crm/people/${uid}`, {
+  const response = await httpRequest('GET', `${apiBase}/crm/people/${uid}`, {
     headers: getOutsetaAuthHeaders(),
     timeout: 8000,
   });
@@ -688,7 +727,7 @@ async function findPersonByEmail(email) {
   if (!email) return null;
 
   const apiBase = getOutsetaApiBase();
-  const response = await axios.get(`${apiBase}/crm/people`, {
+  const response = await httpRequest('GET', `${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
     params: {
       Email: email,
@@ -704,7 +743,7 @@ async function findPersonByField(field, value) {
   if (!field || value == null) return null;
 
   const apiBase = getOutsetaApiBase();
-  const response = await axios.get(`${apiBase}/crm/people`, {
+  const response = await httpRequest('GET', `${apiBase}/crm/people`, {
     headers: getOutsetaAuthHeaders(),
     params: { [field]: value },
     timeout: 12000,
@@ -717,7 +756,8 @@ async function updatePerson(uid, payload) {
   if (!uid) throw new Error('Cannot update person without UID');
 
   const apiBase = getOutsetaApiBase();
-  await axios.put(`${apiBase}/crm/people/${uid}`, payload, {
+  await httpRequest('PUT', `${apiBase}/crm/people/${uid}`, {
+    data: payload,
     headers: getOutsetaAuthHeaders(),
     timeout: 8000,
   });
@@ -725,7 +765,8 @@ async function updatePerson(uid, payload) {
 
 async function createRegistration(payload) {
   const apiBase = getOutsetaApiBase();
-  const response = await axios.post(`${apiBase}/crm/registrations`, payload, {
+  const response = await httpRequest('POST', `${apiBase}/crm/registrations`, {
+    data: payload,
     headers: getOutsetaAuthHeaders(),
     timeout: 8000,
   });
@@ -775,19 +816,12 @@ function toJsonSafe(value) {
 
 async function sendPasswordResetEmail(email) {
   const apiBase = getOutsetaApiBase();
-  const config = {
+  await httpRequest('POST', `${apiBase}/crm/people/forgotPassword`, {
+    data: { Email: email },
     headers: getOutsetaAuthHeaders(),
     timeout: 8000,
-    params: {
-      donotlog: 1,
-    },
-  };
-
-  await axios.post(
-    `${apiBase}/crm/people/forgotPassword`,
-    { Email: email },
-    config
-  );
+    params: { donotlog: 1 },
+  });
 }
 
 function isInvalidGrantError(error) {
@@ -824,9 +858,8 @@ async function createAccountForPerson(person) {
 
   const accountName = buildAccountName(person);
 
-  await axios.post(
-    `${apiBase}/crm/accounts`,
-    {
+  await httpRequest('POST', `${apiBase}/crm/accounts`, {
+    data: {
       Name: accountName,
       PersonAccount: [
         {
@@ -841,11 +874,9 @@ async function createAccountForPerson(person) {
         },
       ],
     },
-    {
-      headers: getOutsetaAuthHeaders(),
-      timeout: 8000,
-    }
-  );
+    headers: getOutsetaAuthHeaders(),
+    timeout: 8000,
+  });
 }
 
 function buildAccountName(person) {
